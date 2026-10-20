@@ -6,6 +6,7 @@ Sammlung kleiner Alltags-Tools in einem Launcher (Python + tkinter).
 **Wechseln:** Strg+1 … Strg+9 öffnet das n-te Tool.
 **Einstellungen & Log:** `%APPDATA%\werkbank\` (`settings.json`, `werkbank.log`) – Fenstergröße, letztes Tool und Tool-Werte werden gemerkt.
 **Tests:** `.venv\Scripts\python -m pytest`
+**Als .exe:** `build.bat` doppelklicken → `dist\werkbank.exe` (eine Datei, kein Python nötig). Fertige Builds gibt es auch unter GitHub → Actions → „build“ → Artefakt `werkbank-exe`.
 
 ## Tools
 
