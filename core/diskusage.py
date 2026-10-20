@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 
 SMALL_FILES_NAME = "[kleine Dateien]"
 
+# Windows: Datei liegt nur in der Cloud (OneDrive „Bei Bedarf“ o. Ä.) und belegt lokal keinen Platz.
+FILE_ATTRIBUTE_OFFLINE = 0x1000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_CLOUD_ONLY = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
 
 @dataclass(eq=False)
 class Node:
@@ -29,6 +34,11 @@ def format_size(n: float) -> str:
             return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}".replace(".", ",")
         n /= 1024
     return ""
+
+
+def format_count(n: int) -> str:
+    """Ganzzahl mit deutschem Tausenderpunkt: 12345 -> „12.345“."""
+    return f"{n:,}".replace(",", ".")
 
 
 def _is_link(entry: os.DirEntry) -> bool:
@@ -71,7 +81,8 @@ def scan(root: str, cancel: threading.Event | None = None, progress=None,
                     node.size += child.size
                     node.file_count += child.file_count
                 elif entry.is_file(follow_symlinks=False):
-                    size = entry.stat(follow_symlinks=False).st_size
+                    st = entry.stat(follow_symlinks=False)
+                    size = 0 if getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY else st.st_size
                     node.size += size
                     node.file_count += 1
                     state["files"] += 1
@@ -95,6 +106,23 @@ def scan(root: str, cancel: threading.Event | None = None, progress=None,
     if progress is not None:
         progress(state["files"], state["bytes"])
     return tree
+
+
+def replace_subtree(old: Node, new: Node) -> None:
+    """Setzt einen neu gescannten Ordner `new` an die Stelle von `old` und korrigiert die Summen darüber."""
+    parent = old.parent
+    new.name = old.name
+    new.parent = parent
+    if parent is None:
+        return
+    parent.children[parent.children.index(old)] = new
+    d_size, d_files = new.size - old.size, new.file_count - old.file_count
+    node = parent
+    while node is not None:
+        node.size += d_size
+        node.file_count += d_files
+        node.children.sort(key=lambda n: n.size, reverse=True)
+        node = node.parent
 
 
 def _worst(row: list[float], side: float) -> float:

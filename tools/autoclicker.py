@@ -13,6 +13,23 @@ from core.registry import Tool
 
 HOTKEY_LABEL = "F6"
 PICK_COUNTDOWN_S = 3
+GA_ROOT = 2
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    # Eigene DLL-Instanz, damit unsere argtypes nicht mit pynput kollidieren. Aus jedem Thread nutzbar.
+    _user32 = ctypes.WinDLL("user32")
+    _user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    _user32.WindowFromPoint.restype = wintypes.HWND
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
+
+    def _toplevel_at(x: int, y: int) -> int:
+        """Handle des obersten sichtbaren Fensters an (x, y) – berücksichtigt Überdeckung."""
+        hit = _user32.WindowFromPoint(wintypes.POINT(x, y))
+        return (_user32.GetAncestor(hit, GA_ROOT) or 0) if hit else 0
 
 
 @dataclass(frozen=True)
@@ -57,8 +74,9 @@ class Clicker:
     def start(self, config: ClickConfig) -> None:
         self.stop()
         self.clicks = 0
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, args=(config,), daemon=True)
+        # Eigenes Event pro Lauf: hängt ein alter Thread noch (join-Timeout), läuft er nicht ungewollt weiter.
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(config, self._stop), daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -67,14 +85,14 @@ class Clicker:
             self._thread.join(timeout=1)
             self._thread = None
 
-    def _run(self, config: ClickConfig) -> None:
+    def _run(self, config: ClickConfig, stop: threading.Event) -> None:
         button = self._buttons[config.button]
         count = 2 if config.double else 1
-        while not self._stop.is_set():
+        while not stop.is_set():
             target = config.position if config.position is not None else tuple(self._mouse.position)
             if self._is_blocked(target):
                 self.waiting = True
-                self._stop.wait(min(config.interval_ms / 1000, self.BLOCKED_RECHECK_S))
+                stop.wait(min(config.interval_ms / 1000, self.BLOCKED_RECHECK_S))
                 continue
             self.waiting = False
             if config.position is not None:
@@ -83,7 +101,7 @@ class Clicker:
             self.clicks += 1
             if config.repeat and self.clicks >= config.repeat:
                 break
-            self._stop.wait(config.interval_ms / 1000)
+            stop.wait(config.interval_ms / 1000)
         self.waiting = False
 
 
@@ -99,25 +117,36 @@ class AutoClicker(Tool):
         self._clicker = Clicker(self._mouse, {
             "left": mouse.Button.left, "right": mouse.Button.right, "middle": mouse.Button.middle,
         }, is_blocked=self._over_own_window)
+        self._hwnd = 0  # Fensterhandle des Launchers (Windows), vom Main-Thread gepflegt
         self._toggle_requests: queue.SimpleQueue[None] = queue.SimpleQueue()
-        self._hotkey = GlobalHotkey(HOTKEY_LABEL, lambda: self._toggle_requests.put(None))
+        self._hotkey: GlobalHotkey | None = None
 
-        self._interval = tk.StringVar(value="100")
-        self._button = tk.StringVar(value="left")
-        self._double = tk.BooleanVar(value=False)
-        self._repeat = tk.StringVar(value="0")
-        self._pos_mode = tk.StringVar(value="cursor")
-        self._fixed_pos: tuple[int, int] | None = None
+        s = self.settings
+        self._interval = tk.StringVar(value=str(s.get("interval", "100")))
+        self._button = tk.StringVar(value=s.get("button") if s.get("button") in ("left", "middle", "right") else "left")
+        self._double = tk.BooleanVar(value=bool(s.get("double", False)))
+        self._repeat = tk.StringVar(value=str(s.get("repeat", "0")))
+        self._fixed_pos = self._valid_pos(s.get("fixed_pos"))
+        self._pos_mode = tk.StringVar(value="fixed" if s.get("pos_mode") == "fixed" and self._fixed_pos else "cursor")
         self._error = tk.StringVar()
         self._root = parent.winfo_toplevel()
 
         self._build_ui(parent)
+        if self._fixed_pos:
+            self._pos_label.configure(text=f"x {self._fixed_pos[0]}  ·  y {self._fixed_pos[1]}")
         try:
+            self._hotkey = GlobalHotkey(HOTKEY_LABEL, lambda: self._toggle_requests.put(None))
             self._hotkey.start()
         except HotkeyError as e:
             self._hotkey = None
             self._error.set(f"{e} – nutze den Start-Button.")
         self._poll()
+
+    @staticmethod
+    def _valid_pos(value) -> tuple[int, int] | None:
+        if isinstance(value, (list, tuple)) and len(value) == 2 and all(isinstance(v, int) for v in value):
+            return (value[0], value[1])
+        return None
 
     # ---------- UI ----------
 
@@ -133,7 +162,7 @@ class AutoClicker(Tool):
         self._counter = ttk.Label(top, text="0", style="Big.TLabel")
         self._counter.grid(row=1, column=0, sticky="w")
         ttk.Label(top, text="Klicks in diesem Lauf", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
-        self._toggle_btn = ttk.Button(top, text=f"Start  ·  {HOTKEY_LABEL}", style="Accent.TButton",
+        self._toggle_btn = ttk.Button(top, text="Start", style="Accent.TButton",
                                       command=self._toggle, takefocus=False)
         self._toggle_btn.grid(row=0, column=1, rowspan=3, sticky="e")
 
@@ -231,28 +260,28 @@ class AutoClicker(Tool):
         self._pos_mode.set("fixed")
         self._pos_label.configure(text=f"x {x}  ·  y {y}")
         self._pick_btn.state(["!disabled"])
+        if self._over_own_window((x, y)):
+            self._error.set("Der Punkt liegt im werkbank-Fenster – dort wird nicht geklickt.")
 
     def _over_own_window(self, pos) -> bool:
-        # Läuft im Klick-Thread: nur das gecachte Rechteck lesen, kein Tk.
+        # Läuft im Klick-Thread: kein Tk, nur gecachte Werte bzw. thread-sichere WinAPI.
+        x, y = (int(v) for v in pos)
+        if sys.platform == "win32":
+            # Fragt das tatsächlich sichtbare Fenster ab: liegt werkbank verdeckt im Hintergrund, wird geklickt.
+            return bool(self._hwnd) and _toplevel_at(x, y) == self._hwnd
         rect = self._window_rect
         if rect is None:
             return False
         left, top, right, bottom = rect
-        x, y = pos
         return left <= x < right and top <= y < bottom
 
     def _update_window_rect(self) -> None:
+        if sys.platform == "win32":
+            self._hwnd = int(self._root.wm_frame(), 16)
+            return
         if self._root.state() == "iconic":
             self._window_rect = None
             return
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
-            r = wintypes.RECT()
-            hwnd = int(self._root.wm_frame(), 16)
-            if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                self._window_rect = (r.left, r.top, r.right, r.bottom)
-                return
         x, y = self._root.winfo_rootx(), self._root.winfo_rooty()
         self._window_rect = (x, y, x + self._root.winfo_width(), y + self._root.winfo_height())
 
@@ -270,11 +299,15 @@ class AutoClicker(Tool):
         if not running:
             status, style = "● BEREIT", "Status.TLabel"
         elif self._clicker.waiting:
-            status, style = "● WARTET – Maus aus dem Fenster bewegen", "Status.TLabel"
+            hint = "Zielpunkt liegt im Fenster" if self._pos_mode.get() == "fixed" else "Maus aus dem Fenster bewegen"
+            status, style = f"● WARTET – {hint}", "Status.TLabel"
         else:
             status, style = "● KLICKT", "StatusOn.TLabel"
         self._status.configure(text=status, style=style)
-        self._toggle_btn.configure(text=f"{'Stop' if running else 'Start'}  ·  {HOTKEY_LABEL}",
+        label = "Stop" if running else "Start"
+        if self._hotkey is not None:
+            label += f"  ·  {HOTKEY_LABEL}"
+        self._toggle_btn.configure(text=label,
                                    style="Stop.TButton" if running else "Accent.TButton")
         self._root.after(50, self._poll)
 
@@ -282,3 +315,7 @@ class AutoClicker(Tool):
         self._clicker.stop()
         if self._hotkey is not None:
             self._hotkey.stop()
+        self.settings.update(interval=self._interval.get(), button=self._button.get(),
+                             double=self._double.get(), repeat=self._repeat.get(),
+                             pos_mode=self._pos_mode.get(),
+                             fixed_pos=list(self._fixed_pos) if self._fixed_pos else None)

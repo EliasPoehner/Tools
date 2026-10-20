@@ -12,12 +12,16 @@ class Tool:
     name = "Unbenannt"
     description = ""
 
+    def __init__(self) -> None:
+        # Vom Launcher vor `build()` gesetzt; Inhalt wird beim Beenden gespeichert (nur JSON-Typen).
+        self.settings: dict = {}
+
     def build(self, parent: ttk.Frame) -> None:
         """Baut die Oberfläche des Tools in `parent`. Wird einmal beim ersten Öffnen aufgerufen."""
         raise NotImplementedError
 
     def on_close(self) -> None:
-        """Aufräumen beim Beenden des Launchers (Threads stoppen, Listener lösen, ...)."""
+        """Aufräumen beim Beenden des Launchers (Threads stoppen, Listener lösen, `self.settings` füllen, ...)."""
 
 
 def discover_tools() -> list[type[Tool]]:

@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from core.diskusage import SMALL_FILES_NAME, ScanCancelled, format_size, scan, squarify
+from core.diskusage import SMALL_FILES_NAME, ScanCancelled, format_count, format_size, replace_subtree, scan, squarify
 
 
 def make_tree(tmp_path):
@@ -80,3 +80,33 @@ def test_format_size():
     assert format_size(1023) == "1023 B"
     assert format_size(1536) == "1,5 KB"
     assert format_size(5 * 1024**3) == "5,0 GB"
+
+
+def test_replace_subtree_updates_totals(tmp_path):
+    make_tree(tmp_path)
+    tree = scan(str(tmp_path), min_file_size=1000)
+    gross = next(c for c in tree.children if c.name == "gross")
+    (tmp_path / "gross" / "a.bin").unlink()
+    (tmp_path / "gross" / "neu.bin").write_bytes(b"x" * 9000)
+    fresh = scan(gross.path, min_file_size=1000)
+    replace_subtree(gross, fresh)
+    assert fresh.parent is tree and fresh.name == "gross"
+    assert gross not in tree.children
+    assert fresh.size == 11000
+    assert tree.size == 5600 - 3000 + 9000
+    assert tree.file_count == 4
+    sizes = [c.size for c in tree.children]
+    assert sizes == sorted(sizes, reverse=True)
+
+
+def test_replace_root_keeps_it_root(tmp_path):
+    make_tree(tmp_path)
+    old = scan(str(tmp_path))
+    new = scan(str(tmp_path))
+    replace_subtree(old, new)
+    assert new.parent is None
+
+
+def test_format_count():
+    assert format_count(7) == "7"
+    assert format_count(1234567) == "1.234.567"
