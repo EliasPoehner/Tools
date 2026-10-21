@@ -20,11 +20,6 @@ jobs:
           python -m venv .venv
           .venv\Scripts\python -m pip install -q -r requirements.txt
           .venv\Scripts\python -m pytest -v
-      - name: Prozess-Scan in gepackter .exe prüfen (vorübergehend)
-        run: |
-          .venv\Scripts\python -m pip install -q pyinstaller
-          .venv\Scripts\python -m PyInstaller --noconfirm --log-level WARN --onefile --console --name scanbench --paths . --distpath benchdist scripts\bench_scan.py
-          .\benchdist\scanbench.exe "C:\Program Files (x86)"
       - name: werkbank.exe bauen
         shell: cmd
         run: build.bat

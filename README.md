@@ -13,7 +13,7 @@ Sammlung kleiner Alltags-Tools in einem Launcher (Python + tkinter).
 | Tool | Was es macht |
 |---|---|
 | Autoklicker | Klickt im Intervall (Taste, Doppelklick, Anzahl, fester Punkt). **F6** startet/stoppt global. Klickt nie ins eigene Fenster – solange es unter der Maus sichtbar ist, wartet er (liegt es verdeckt im Hintergrund, wird normal geklickt). |
-| Speicher | Speicher-Explorer: Treemap zeigt grafisch, welche Ordner/Dateien wie viel Platz belegen. Klick auf Kachel öffnet den Ordner, „↑ Hoch“ geht zurück, „Im Explorer“ öffnet ihn in Windows. Rechtsklick/Backspace = zurück, Doppelklick auf Datei = im Explorer zeigen, „↻ Aktualisieren“ scannt nur den aktuellen Ordner neu. Dateien < 1 MB werden pro Ordner zusammengefasst, reine Cloud-Platzhalter (OneDrive) zählen als 0. |
+| Speicher | Speicher-Explorer: Treemap zeigt grafisch, welche Ordner/Dateien wie viel Platz belegen. Klick auf Kachel öffnet den Ordner, „↑ Hoch“ geht zurück, „Im Explorer“ öffnet ihn in Windows. Rechtsklick/Backspace = zurück, Doppelklick auf Datei = im Explorer zeigen, „↻ Aktualisieren“ scannt nur den aktuellen Ordner neu. Dateien < 1 MB werden pro Ordner zusammengefasst, reine Cloud-Platzhalter (OneDrive) zählen als 0. Große Ordner werden parallel in mehreren Prozessen gelesen, die Treemap baut sich schon während des Scans auf. |
 
 ## Neues Tool hinzufügen
 
@@ -43,3 +43,4 @@ class MeinTool(Tool):
 - Arbeit in Threads: Tk-Widgets nur im Main-Thread anfassen (per `after()`-Polling, siehe Autoklicker).
 - Logik von der UI trennen, damit sie ohne Fenster testbar ist (`tests/`).
 - Neue Abhängigkeiten in `requirements.txt` eintragen.
+- Scan-Geschwindigkeit messen: `python scripts/bench_scan.py ORDNER`.
