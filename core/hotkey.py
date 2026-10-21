@@ -49,11 +49,16 @@ class GlobalHotkey:
             _next_id += 1
 
     def start(self) -> None:
+        if self._thread is not None:
+            return  # läuft schon – zweites RegisterHotKey würde nur scheitern
         self._ready.clear()
         self._error = None
+        self._thread_id = 0
         self._thread = threading.Thread(target=self._run, name="GlobalHotkey", daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=2)
+        if not self._ready.wait(timeout=2):
+            self.stop()
+            raise HotkeyError(f"{self.key} konnte nicht registriert werden (Zeitüberschreitung)")
         if self._error:
             self._thread.join(timeout=1)
             self._thread = None
@@ -63,7 +68,8 @@ class GlobalHotkey:
         if self._thread is None:
             return
         import ctypes
-        ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         self._thread.join(timeout=1)
         self._thread = None
 

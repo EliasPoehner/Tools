@@ -1,8 +1,10 @@
+import os
 import threading
 
 import pytest
 
-from core.diskusage import SMALL_FILES_NAME, ScanCancelled, format_size, scan, squarify
+from core import diskusage
+from core.diskusage import SMALL_FILES_NAME, ScanCancelled, format_count, format_size, replace_subtree, scan, squarify
 
 
 def make_tree(tmp_path):
@@ -80,3 +82,89 @@ def test_format_size():
     assert format_size(1023) == "1023 B"
     assert format_size(1536) == "1,5 KB"
     assert format_size(5 * 1024**3) == "5,0 GB"
+
+
+def test_replace_subtree_updates_totals(tmp_path):
+    make_tree(tmp_path)
+    tree = scan(str(tmp_path), min_file_size=1000)
+    gross = next(c for c in tree.children if c.name == "gross")
+    (tmp_path / "gross" / "a.bin").unlink()
+    (tmp_path / "gross" / "neu.bin").write_bytes(b"x" * 9000)
+    fresh = scan(gross.path, min_file_size=1000)
+    replace_subtree(gross, fresh)
+    assert fresh.parent is tree and fresh.name == "gross"
+    assert gross not in tree.children
+    assert fresh.size == 11000
+    assert tree.size == 5600 - 3000 + 9000
+    assert tree.file_count == 4
+    sizes = [c.size for c in tree.children]
+    assert sizes == sorted(sizes, reverse=True)
+
+
+def test_replace_root_keeps_it_root(tmp_path):
+    make_tree(tmp_path)
+    old = scan(str(tmp_path))
+    new = scan(str(tmp_path))
+    replace_subtree(old, new)
+    assert new.parent is None
+
+
+def test_format_count():
+    assert format_count(7) == "7"
+    assert format_count(1234567) == "1.234.567"
+
+
+def make_wide_tree(tmp_path, dirs=12):
+    for d in range(dirs):
+        for s in range(3):
+            sub = tmp_path / f"d{d}" / f"s{s}" / "tief"
+            sub.mkdir(parents=True)
+            (sub / "gross.bin").write_bytes(b"x" * (2000 + d * 10 + s))
+            (sub.parent / "klein.txt").write_bytes(b"x" * (d + 1))
+    (tmp_path / "wurzel.bin").write_bytes(b"x" * 5000)
+
+
+def flatten(node, base):
+    rows = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        rows.append((os.path.relpath(n.path, base), n.name, n.size, n.is_dir, n.is_aggregate, n.file_count,
+                     n.parent.path if n.parent else None))
+        stack.extend(n.children)
+    return sorted(rows, key=repr)
+
+
+def test_parallel_scan_equals_sequential(tmp_path):
+    make_wide_tree(tmp_path)
+    seq = scan(str(tmp_path), min_file_size=1000, processes=1)
+    tasks_before = diskusage._tasks_done
+    par = scan(str(tmp_path), min_file_size=1000, processes=2)
+    assert not diskusage._pool_broken
+    assert diskusage._tasks_done - tasks_before == 12  # alle 12 Ordner liefen im Pool
+    assert flatten(par, tmp_path) == flatten(seq, tmp_path)
+    assert par.size == seq.size and par.file_count == 12 * 3 * 2 + 1
+    stack = [par]
+    while stack:  # überall absteigend sortiert
+        n = stack.pop()
+        sizes = [c.size for c in n.children]
+        assert sizes == sorted(sizes, reverse=True)
+        stack.extend(n.children)
+
+
+def test_parallel_scan_reports_live_root_and_progress(tmp_path):
+    make_wide_tree(tmp_path)
+    started, calls = [], []
+    tree = scan(str(tmp_path), min_file_size=1000, processes=2, on_start=started.append,
+                progress=lambda f, b: calls.append((f, b)))
+    assert started == [tree]
+    assert calls[-1] == (tree.file_count, tree.size)
+
+
+def test_parallel_cancel(tmp_path):
+    make_wide_tree(tmp_path)
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(ScanCancelled):
+        scan(str(tmp_path), cancel=ev, processes=2)
+

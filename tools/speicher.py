@@ -5,12 +5,13 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 from core import theme
-from core.diskusage import Node, ScanCancelled, format_size, scan, squarify
+from core.diskusage import Node, ScanCancelled, format_count, format_size, replace_subtree, scan, shutdown_pool, squarify
 from core.registry import Tool
 
 # gedeckte Farben, die zum dunklen Bernstein-Look passen
@@ -19,11 +20,13 @@ PALETTE = ["#d9893a", "#4f9d8c", "#7f8fd1", "#c4636f", "#9bb55a", "#b07fc4",
 AGGREGATE_COLOR = "#4a4d53"
 MIN_TILE_PX = 3  # kleinere Kacheln werden nicht gezeichnet
 MAX_TILES = 400
+PREVIEW_EVERY_MS = 600  # während des Scans die Treemap so oft mit dem Zwischenstand neu zeichnen
 
 
 class Speicher(Tool):
     name = "Speicher"
-    description = "Zeigt grafisch, welche Ordner und Dateien wie viel Platz belegen. Klick auf eine Kachel öffnet den Ordner."
+    description = ("Zeigt grafisch, welche Ordner und Dateien wie viel Platz belegen. Klick auf eine Kachel öffnet "
+                   "den Ordner, Rechtsklick geht zurück, Doppelklick auf eine Datei zeigt sie im Explorer.")
 
     def build(self, parent: ttk.Frame) -> None:
         self.parent = parent
@@ -36,11 +39,17 @@ class Speicher(Tool):
         self.results: queue.Queue = queue.Queue()
         self.progress = (0, 0)
         self.scanning = False
+        self.refresh_target: Node | None = None  # gesetzt, wenn nur ein Teilbaum neu gescannt wird
+        self.partial: Node | None = None  # Wurzel des laufenden Scans (wächst live)
+        self.last_preview = 0.0
 
         top = ttk.Frame(parent)
         top.pack(fill="x")
-        self.path_var = tk.StringVar(value=str(Path.home()))
-        ttk.Entry(top, textvariable=self.path_var).pack(side="left", fill="x", expand=True, ipady=3)
+        last = self.settings.get("path")
+        self.path_var = tk.StringVar(value=last if isinstance(last, str) and os.path.isdir(last) else str(Path.home()))
+        entry = ttk.Entry(top, textvariable=self.path_var)
+        entry.pack(side="left", fill="x", expand=True, ipady=3)
+        entry.bind("<Return>", lambda e: None if self.scanning else self.toggle_scan())
         ttk.Button(top, text="Ordner…", command=self.choose).pack(side="left", padx=(6, 0))
         self.scan_btn = ttk.Button(top, text="Scannen", style="Accent.TButton", command=self.toggle_scan)
         self.scan_btn.pack(side="left", padx=(6, 0))
@@ -51,6 +60,8 @@ class Speicher(Tool):
         self.up_btn.pack(side="left")
         self.open_btn = ttk.Button(nav, text="Im Explorer", command=self.open_in_explorer, state="disabled")
         self.open_btn.pack(side="left", padx=(6, 0))
+        self.refresh_btn = ttk.Button(nav, text="↻ Aktualisieren", command=self.refresh_current, state="disabled")
+        self.refresh_btn.pack(side="left", padx=(6, 0))
         self.crumb = ttk.Label(nav, text="", style="Muted.TLabel")
         self.crumb.pack(side="left", padx=12)
 
@@ -66,6 +77,8 @@ class Speicher(Tool):
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", self.on_list_open)
         self.tree.bind("<<TreeviewSelect>>", self.on_list_select)
+        self.tree.bind("<Return>", self.on_list_open)
+        self.tree.bind("<BackSpace>", lambda e: self.go_up())
 
         self.canvas = tk.Canvas(body, bg=theme.BG, highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -73,6 +86,8 @@ class Speicher(Tool):
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<Leave>", lambda e: self.set_info(self.default_info()))
         self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<Double-1>", self.on_canvas_double)
+        self.canvas.bind("<Button-3>", lambda e: self.go_up())
 
         self.info = ttk.Label(parent, text="Ordner wählen und auf „Scannen“ klicken.", style="Muted.TLabel")
         self.info.pack(anchor="w", pady=(8, 0))
@@ -84,25 +99,42 @@ class Speicher(Tool):
         folder = filedialog.askdirectory(initialdir=self.path_var.get() or None)
         if folder:
             self.path_var.set(os.path.normpath(folder))
-            self.toggle_scan() if not self.scanning else None
+            if not self.scanning:
+                self.toggle_scan()
 
     def toggle_scan(self) -> None:
         if self.scanning:
             self.cancel.set()
             return
-        path = self.path_var.get().strip()
+        path = self.path_var.get().strip().strip('"')
         if not os.path.isdir(path):
             self.set_info(f"„{path}“ ist kein Ordner.")
             return
+        self.refresh_target = None
+        self.start_scan(path)
+
+    def refresh_current(self) -> None:
+        """Scannt nur den gerade angezeigten Ordner neu (z. B. nach dem Aufräumen) und behält den Rest."""
+        if self.scanning or self.current is None:
+            return
+        self.refresh_target = self.current
+        self.start_scan(self.current.path)
+
+    def start_scan(self, path: str) -> None:
         self.cancel = threading.Event()
         self.progress = (0, 0)
         self.scanning = True
         self.scan_btn.configure(text="Abbrechen", style="Stop.TButton")
+        self.refresh_btn.configure(state="disabled")
+        self.partial = None
         cancel = self.cancel
+        # Teilbaum-Aktualisierung ohne Vorschau: der alte Stand bleibt sichtbar, bis der neue fertig ist.
+        on_start = None if self.refresh_target is not None else (lambda t: setattr(self, "partial", t))
 
         def work():
             try:
-                tree = scan(path, cancel, progress=lambda f, b: setattr(self, "progress", (f, b)))
+                tree = scan(path, cancel, progress=lambda f, b: setattr(self, "progress", (f, b)),
+                            on_start=on_start)
                 self.results.put(("done", tree))
             except ScanCancelled:
                 self.results.put(("cancelled", None))
@@ -118,27 +150,72 @@ class Speicher(Tool):
             kind, payload = self.results.get_nowait()
         except queue.Empty:
             files, size = self.progress
-            self.set_info(f"Scanne … {files:,} Dateien, {format_size(size)}".replace(",", "."))
+            self.set_info(f"Scanne … {format_count(files)} Dateien, {format_size(size)}")
+            self.update_preview()
             self.parent.after(150, self.poll)
             return
         self.scanning = False
+        partial, self.partial = self.partial, None
         self.scan_btn.configure(text="Scannen", style="Accent.TButton")
+        target, self.refresh_target = self.refresh_target, None
+        if self.current is not None:
+            self.refresh_btn.configure(state="normal")
         if kind == "done":
-            self.root_node = payload
-            self.show(payload)
-        elif kind == "cancelled":
-            self.set_info("Scan abgebrochen.")
-        else:
-            self.set_info(f"Fehler beim Scannen: {payload}")
+            if target is not None:
+                replace_subtree(target, payload)
+                if target is self.root_node:
+                    self.root_node = payload
+                self.show(payload)
+            else:
+                self.root_node = payload
+                # Wer während des Scans schon in einen Ordner geklickt hat, bleibt dort.
+                self.show(self.current if self.in_tree(self.current, payload) else payload)
+            return
+        if partial is not None and self.in_tree(self.current, partial):
+            # Vorschau eines abgebrochenen Scans verwerfen
+            if self.root_node is not None:
+                self.show(self.root_node)
+            else:
+                self.clear_view()
+        self.set_info("Scan abgebrochen." if kind == "cancelled" else f"Fehler beim Scannen: {payload}")
+
+    def update_preview(self) -> None:
+        now = time.monotonic()
+        if self.partial is None or now - self.last_preview < PREVIEW_EVERY_MS / 1000:
+            return
+        self.last_preview = now
+        # Neuer Scan: Vorschau übernimmt die Anzeige; wer darin navigiert hat, sieht seinen Ordner live wachsen.
+        self.show(self.current if self.in_tree(self.current, self.partial) else self.partial)
+
+    @staticmethod
+    def in_tree(node: Node | None, root: Node) -> bool:
+        while node is not None:
+            if node is root:
+                return True
+            node = node.parent
+        return False
+
+    def clear_view(self) -> None:
+        self.current = self.selected = None
+        self.items = []
+        self.tree.delete(*self.tree.get_children())
+        self.crumb.configure(text="")
+        self.up_btn.configure(state="disabled")
+        self.open_btn.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
+        self.draw()
 
     # --- Anzeige ----------------------------------------------------------
 
     def show(self, node: Node) -> None:
         self.current = node
         self.selected = None
-        self.items = [c for c in node.children if c.size > 0]
+        # Kopie + Sortierung: während eines Scans wachsen die Größen noch
+        self.items = sorted((c for c in list(node.children) if c.size > 0), key=lambda n: n.size, reverse=True)
         self.up_btn.configure(state="normal" if node.parent is not None else "disabled")
         self.open_btn.configure(state="normal")
+        if not self.scanning:
+            self.refresh_btn.configure(state="normal")
         self.crumb.configure(text=f"{node.path}  ·  {format_size(node.size)}")
         self.tree.delete(*self.tree.get_children())
         total = node.size or 1
@@ -147,13 +224,14 @@ class Speicher(Tool):
             pct = f"{child.size / total * 100:.0f}%" if child.size / total >= 0.01 else "<1%"
             self.tree.insert("", "end", iid=str(i), text=label, values=(format_size(child.size), pct))
         self.draw()
-        self.set_info(self.default_info())
+        if not self.scanning:
+            self.set_info(self.default_info())
 
     def default_info(self) -> str:
         if self.current is None:
             return "Ordner wählen und auf „Scannen“ klicken."
-        return (f"{self.current.file_count:,} Dateien · {format_size(self.current.size)} "
-                "· Klick auf Kachel = Ordner öffnen").replace(",", ".")
+        return (f"{format_count(self.current.file_count)} Dateien · {format_size(self.current.size)} "
+                "· Klick auf Kachel = Ordner öffnen")
 
     def set_info(self, text: str) -> None:
         self.info.configure(text=text)
@@ -203,7 +281,7 @@ class Speicher(Tool):
             return
         total = self.current.size or 1
         kind = "Ordner" if node.is_dir else ("Sammlung" if node.is_aggregate else "Datei")
-        extra = f" · {node.file_count:,} Dateien".replace(",", ".") if node.file_count > 1 else ""
+        extra = f" · {format_count(node.file_count)} Dateien" if node.file_count > 1 else ""
         self.set_info(f"{node.name} ({kind}) · {format_size(node.size)} · {node.size / total * 100:.1f}%{extra}")
 
     def on_canvas_click(self, event) -> None:
@@ -216,6 +294,12 @@ class Speicher(Tool):
             self.selected = node
             self.sync_list_selection()
             self.draw()
+
+    def on_canvas_double(self, event) -> None:
+        node = self.node_at(event)
+        # Nur wenn der erste Klick dieselbe Datei ausgewählt hat (nicht nach einem Ordnerwechsel).
+        if node is not None and not node.is_dir and node is self.selected:
+            self.open_in_explorer()
 
     def on_list_select(self, _event) -> None:
         sel = self.tree.selection()
@@ -256,3 +340,5 @@ class Speicher(Tool):
 
     def on_close(self) -> None:
         self.cancel.set()
+        shutdown_pool()
+        self.settings["path"] = self.path_var.get().strip()

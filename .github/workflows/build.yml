@@ -1,0 +1,29 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # .venv hier anlegen, damit build.bat dieselbe Python-Version nutzt wie die Tests.
+      - name: Tests
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install -q -r requirements.txt
+          .venv\Scripts\python -m pytest -v
+      - name: werkbank.exe bauen
+        shell: cmd
+        run: build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: werkbank-exe
+          path: dist/werkbank.exe
