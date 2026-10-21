@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core import diskusage  # noqa: E402
 from core.diskusage import scan, shutdown_pool  # noqa: E402
 
 
@@ -35,6 +36,7 @@ def main() -> None:
         for label, fn in configs[:1] + configs:  # erster Lauf wärmt den Cache
             run(label, lambda: fn(root))
             shutdown_pool()  # Pool-Start jedes Mal mitmessen (wie beim ersten Scan nach App-Start)
+    print(f"Pool-Aufgaben: {diskusage._tasks_done}, Pool defekt: {diskusage._pool_broken}")
 
 
 if __name__ == "__main__":
