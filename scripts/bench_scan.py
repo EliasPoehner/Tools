@@ -37,6 +37,8 @@ def main() -> None:
             run(label, lambda: fn(root))
             shutdown_pool()  # Pool-Start jedes Mal mitmessen (wie beim ersten Scan nach App-Start)
     print(f"Pool-Aufgaben: {diskusage._tasks_done}, Pool defekt: {diskusage._pool_broken}")
+    if diskusage._pool_broken:
+        sys.exit("Prozess-Pool ließ sich nicht starten – Scan lief nur im eigenen Prozess")
 
 
 if __name__ == "__main__":
