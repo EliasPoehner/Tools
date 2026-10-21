@@ -200,6 +200,9 @@ def _fan_out(frontier: list[Node], cancel, progress, min_file_size: int,
             pool_cancel.set()
             for f in pending:
                 f.cancel()
+            # Laufende Aufgaben sehen das Signal beim nächsten Ordner; abwarten, damit ein sofort
+            # folgender Scan (der das Signal zurücksetzt) sie nicht wieder weiterlaufen lässt.
+            wait(pending, timeout=2)
             return []
         for f in done:
             node = pending.pop(f)
