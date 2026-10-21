@@ -1,8 +1,8 @@
 """Speicherplatz-Analyse: Ordnerbaum einlesen und als Treemap-Rechtecke anordnen (ohne UI, testbar)."""
 
 import os
-import queue
 import threading
+import time
 from dataclasses import dataclass, field
 
 SMALL_FILES_NAME = "[kleine Dateien]"
@@ -49,16 +49,183 @@ def _is_junction(entry: os.DirEntry) -> bool:
         return False
 
 
-DEFAULT_WORKERS = min(16, (os.cpu_count() or 4) * 2)
+# Mehrere Prozesse statt Threads: os.scandir gibt pro Eintrag das GIL frei – mit Threads blockieren
+# sich die Leser dadurch gegenseitig (gemessen: 2 Threads ~4x, 8 Threads ~12x langsamer als einer).
+DEFAULT_PROCESSES = max(1, min(8, os.cpu_count() or 1))
+_FAN_OUT_MIN_DIRS = 8  # weniger Ordner lohnen den Prozess-Pool nicht
+
+_pool = None
+_pool_cancel = None
+_pool_lock = threading.Lock()
+_pool_broken = False
+_worker_cancel = None
+_tasks_done = 0  # Zähler für Tests: wie viele Ordner im Pool gelesen wurden
+
+
+def _read_dir(node: Node, min_file_size: int) -> tuple[list[Node], int, int]:
+    """Liest einen Ordner: hängt Dateien/Sammelknoten an `node`, liefert (Unterordner, Dateien, Bytes)."""
+    files = size = small_size = small_count = 0
+    subdirs: list[Node] = []
+    big: list[Node] = []
+    try:
+        with os.scandir(node.path) as it:  # Windows: Größe kommt ohne extra Systemaufruf mit
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if not _is_junction(entry):
+                            subdirs.append(Node(entry.name, entry.path, is_dir=True, parent=node))
+                    elif entry.is_file(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        n = 0 if getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY else st.st_size
+                        files += 1
+                        size += n
+                        if n >= min_file_size:
+                            big.append(Node(entry.name, entry.path, n, parent=node, file_count=1))
+                        else:
+                            small_size += n
+                            small_count += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass  # kein Zugriff o. Ä.: Ordner bleibt leer
+    if small_count:
+        big.append(Node(SMALL_FILES_NAME, node.path, small_size, is_aggregate=True,
+                        file_count=small_count, parent=node))
+    node.children = subdirs + big
+    p = node
+    while p is not None:  # Summen sofort nach oben tragen -> Live-Vorschau
+        p.size += size
+        p.file_count += files
+        p = p.parent
+    return subdirs, files, size
+
+
+def _walk(start: Node, cancel, min_file_size: int, totals: list[int] | None = None, progress=None) -> None:
+    """Liest `start` samt Unterordnern im aktuellen Prozess (iterativ: beliebige Tiefe)."""
+    stack = [start]
+    last = 0.0
+    while stack:
+        if cancel is not None and cancel.is_set():
+            return
+        subdirs, files, size = _read_dir(stack.pop(), min_file_size)
+        stack.extend(subdirs)
+        if totals is not None:
+            totals[0] += files
+            totals[1] += size
+            if progress is not None and (now := time.monotonic()) - last > 0.1:
+                last = now
+                progress(totals[0], totals[1])
+
+
+def _init_worker(cancel) -> None:
+    global _worker_cancel
+    _worker_cancel = cancel
+
+
+def _scan_task(path: str, min_file_size: int) -> list[tuple]:
+    """Läuft im Pool-Prozess. Ergebnis flach (Vorordnung, Index des Elternknotens) statt verschachtelt:
+    klein beim Übertragen und ohne Rekursionstiefe beim Pickeln."""
+    root = Node("", path, is_dir=True)
+    _walk(root, _worker_cancel, min_file_size)
+    flat: list[tuple] = []
+    stack: list[tuple[Node, int]] = [(root, -1)]
+    while stack:
+        node, parent_idx = stack.pop()
+        idx = len(flat)
+        flat.append((parent_idx, node.name, node.size, node.is_dir, node.is_aggregate, node.file_count))
+        stack.extend((c, idx) for c in node.children)
+    return flat
+
+
+def _graft(target: Node, flat: list[tuple]) -> tuple[int, int]:
+    """Baut das Ergebnis von `_scan_task` unter `target` (Platzhalter im Baum) wieder auf."""
+    nodes = [target]
+    for parent_idx, name, size, is_dir, is_agg, count in flat[1:]:
+        parent = nodes[parent_idx]
+        path = parent.path if is_agg else os.path.join(parent.path, name)
+        node = Node(name, path, size, is_dir, is_agg, count, parent=parent)
+        parent.children.append(node)
+        nodes.append(node)
+    _, _, size, _, _, files = flat[0]
+    p = target
+    while p is not None:
+        p.size += size
+        p.file_count += files
+        p = p.parent
+    return files, size
+
+
+def _get_pool(processes: int):
+    global _pool, _pool_cancel
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    with _pool_lock:
+        if _pool is None:
+            ctx = multiprocessing.get_context("spawn")  # überall gleich wie unter Windows
+            _pool_cancel = ctx.Event()
+            _pool = ProcessPoolExecutor(processes, mp_context=ctx, initializer=_init_worker,
+                                        initargs=(_pool_cancel,))
+        return _pool, _pool_cancel
+
+
+def shutdown_pool() -> None:
+    """Beendet den Prozess-Pool (z. B. beim Schließen der App)."""
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            _pool_cancel.set()
+            _pool.shutdown(wait=False, cancel_futures=True)
+            _pool = None
+
+
+def _fan_out(frontier: list[Node], cancel, progress, min_file_size: int,
+             processes: int, totals: list[int]) -> list[Node]:
+    """Verteilt Ordner auf den Prozess-Pool. Gibt zurück, was nicht im Pool erledigt wurde."""
+    global _pool_broken, _tasks_done
+    from concurrent.futures import FIRST_COMPLETED, wait
+    from concurrent.futures.process import BrokenProcessPool
+
+    try:
+        pool, pool_cancel = _get_pool(processes)
+        pool_cancel.clear()
+        pending = {pool.submit(_scan_task, n.path, min_file_size): n for n in frontier}
+    except Exception:  # z. B. Prozessstart verboten -> im eigenen Prozess weitermachen
+        _pool_broken = True
+        return frontier
+    left: list[Node] = []
+    while pending:
+        done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+        if cancel is not None and cancel.is_set():
+            pool_cancel.set()
+            for f in pending:
+                f.cancel()
+            return []
+        for f in done:
+            node = pending.pop(f)
+            try:
+                files, size = _graft(node, f.result())
+                _tasks_done += 1
+            except BrokenProcessPool:
+                _pool_broken = True
+                shutdown_pool()
+                left.append(node)
+                left.extend(pending.values())
+                return left
+            totals[0] += files
+            totals[1] += size
+        if progress is not None:
+            progress(totals[0], totals[1])
+    return left
 
 
 def scan(root: str, cancel: threading.Event | None = None, progress=None,
-         min_file_size: int = 1 << 20, workers: int = DEFAULT_WORKERS, on_start=None) -> Node:
-    """Liest `root` ein – mehrere Ordner parallel. Symlinks/Junctions werden übersprungen.
+         min_file_size: int = 1 << 20, processes: int = DEFAULT_PROCESSES, on_start=None) -> Node:
+    """Liest `root` ein, große Bäume parallel in mehreren Prozessen. Symlinks/Junctions werden übersprungen.
 
     Dateien unter `min_file_size` werden pro Ordner zu einem Sammelknoten zusammengefasst,
     damit der Baum auch bei Millionen Dateien klein bleibt.
-    `progress(file_count, total_bytes)` wird etwa alle 100 ms aufgerufen.
+    `progress(file_count, total_bytes)` wird regelmäßig aufgerufen.
     `on_start(root_node)` bekommt den Wurzelknoten sofort: Größen darin wachsen live mit,
     Kinder sind aber erst nach Ende sortiert (für eine Vorschau während des Scans).
     """
@@ -66,87 +233,36 @@ def scan(root: str, cancel: threading.Event | None = None, progress=None,
     tree = Node(name=root, path=root, is_dir=True)
     if on_start is not None:
         on_start(tree)
-
-    lock = threading.Lock()
     totals = [0, 0]  # Dateien, Bytes
-    outstanding = 1  # Ordner in der Warteschlange oder in Arbeit
-    done = threading.Event()
-    errors: list[BaseException] = []
-    todo: queue.SimpleQueue[Node | None] = queue.SimpleQueue()
-    todo.put(tree)
 
-    def read_dir(node: Node) -> list[Node]:
-        files = size = small_size = small_count = 0
-        subdirs: list[Node] = []
-        big: list[Node] = []
-        try:
-            with os.scandir(node.path) as it:  # Windows: liest ohne GIL, Größe kommt gratis mit
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if not _is_junction(entry):
-                                subdirs.append(Node(entry.name, entry.path, is_dir=True, parent=node))
-                        elif entry.is_file(follow_symlinks=False):
-                            st = entry.stat(follow_symlinks=False)
-                            n = 0 if getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY else st.st_size
-                            files += 1
-                            size += n
-                            if n >= min_file_size:
-                                big.append(Node(entry.name, entry.path, n, parent=node, file_count=1))
-                            else:
-                                small_size += n
-                                small_count += 1
-                    except OSError:
-                        continue
-        except OSError:
-            pass  # kein Zugriff o. Ä.: Ordner bleibt leer
-        if small_count:
-            big.append(Node(SMALL_FILES_NAME, node.path, small_size, is_aggregate=True,
-                            file_count=small_count, parent=node))
-        node.children = subdirs + big
-        with lock:
+    def check_cancel() -> None:
+        if cancel is not None and cancel.is_set():
+            raise ScanCancelled
+
+    # Obere Ebenen hier lesen, bis genug Ordner da sind, um sie auf Prozesse zu verteilen.
+    frontier = [tree]
+    parallel = processes > 1 and not _pool_broken
+    for _ in range(3 if parallel else 0):
+        if not frontier or len(frontier) >= processes * 4:
+            break
+        nxt: list[Node] = []
+        for node in frontier:
+            check_cancel()
+            subdirs, files, size = _read_dir(node, min_file_size)
+            nxt += subdirs
             totals[0] += files
             totals[1] += size
-            p = node
-            while p is not None:  # Summen sofort nach oben tragen -> Live-Vorschau
-                p.size += size
-                p.file_count += files
-                p = p.parent
-        return subdirs
-
-    def worker() -> None:
-        nonlocal outstanding
-        while (node := todo.get()) is not None:
-            subdirs: list[Node] = []
-            try:
-                if not (cancel is not None and cancel.is_set()):
-                    subdirs = read_dir(node)
-            except BaseException as e:  # unerwartet: merken, im Aufrufer-Thread erneut werfen
-                errors.append(e)
-            with lock:
-                outstanding += len(subdirs) - 1
-                finished = outstanding == 0
-            for d in subdirs:
-                todo.put(d)
-            if finished:
-                done.set()
-
-    threads = [threading.Thread(target=worker, name="scan", daemon=True) for _ in range(max(1, workers))]
-    for t in threads:
-        t.start()
-    while not done.wait(0.1):
+        frontier = nxt
         if progress is not None:
             progress(totals[0], totals[1])
-    for _ in threads:
-        todo.put(None)
-    for t in threads:
-        t.join()
-    if errors:
-        raise errors[0]
-    if cancel is not None and cancel.is_set():
-        raise ScanCancelled
 
-    stack = [tree]  # iterativ statt rekursiv: auch beliebig tiefe Ordner sind kein Problem
+    if parallel and len(frontier) >= _FAN_OUT_MIN_DIRS:
+        frontier = _fan_out(frontier, cancel, progress, min_file_size, processes, totals)
+    for node in frontier:  # Rest (oder alles, wenn nicht parallel) im eigenen Prozess
+        _walk(node, cancel, min_file_size, totals, progress)
+    check_cancel()
+
+    stack = [tree]  # sortieren, iterativ
     while stack:
         node = stack.pop()
         node.children.sort(key=lambda n: n.size, reverse=True)

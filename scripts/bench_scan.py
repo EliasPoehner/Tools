@@ -3,32 +3,13 @@
 Mit --cold ORDNER1 ORDNER2 …: jede Variante liest einen eigenen, noch nicht gecachten Ordner.
 """
 
-import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.diskusage import scan  # noqa: E402
-
-
-def _scan_one(path: str):
-    return scan(path, workers=1)
-
-
-def scan_processes(root: str, procs: int):
-    """Prototyp: Unterordner der 2. Ebene auf Prozesse verteilen (nur Messung, ohne Zusammenbau)."""
-    tasks = []
-    for e in os.scandir(root):
-        if e.is_dir(follow_symlinks=False):
-            try:
-                tasks += [s.path for s in os.scandir(e.path) if s.is_dir(follow_symlinks=False)]
-            except OSError:
-                pass
-    with ProcessPoolExecutor(procs) as ex:
-        return sum(t.file_count for t in ex.map(_scan_one, tasks, chunksize=4))
+from core.diskusage import scan, shutdown_pool  # noqa: E402
 
 
 def run(label: str, fn) -> None:
@@ -39,21 +20,24 @@ def run(label: str, fn) -> None:
 
 
 def main() -> None:
-    configs = [("1 Thread", lambda r: scan(r, workers=1).file_count)]
-    configs += [(f"{w} Threads", lambda r, w=w: scan(r, workers=w).file_count) for w in (2, 4, 8)]
-    configs += [(f"{p} Prozesse", lambda r, p=p: scan_processes(r, p)) for p in (2, 4)]
+    configs = [(f"{p} Prozess" + ("e" if p > 1 else ""), lambda r, p=p: scan(r, processes=p).file_count)
+               for p in (1, 2, 4, 8)]
     args = sys.argv[1:]
     if args and args[0] == "--cold":
         # Gleichartige, noch ungelesene Ordner: jede Variante bekommt einen eigenen, kalten.
         print("kalt (je Variante ein eigener, gleichartiger Ordner)")
         for root, (label, fn) in zip(args[1:], configs):
             run(f"{label}", lambda: fn(root))
+            shutdown_pool()
         return
     for root in args:
         print(root)
         for label, fn in configs[:1] + configs:  # erster Lauf wärmt den Cache
             run(label, lambda: fn(root))
+            shutdown_pool()  # Pool-Start jedes Mal mitmessen (wie beim ersten Scan nach App-Start)
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

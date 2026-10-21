@@ -5,12 +5,13 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 from core import theme
-from core.diskusage import Node, ScanCancelled, format_count, format_size, replace_subtree, scan, squarify
+from core.diskusage import Node, ScanCancelled, format_count, format_size, replace_subtree, scan, shutdown_pool, squarify
 from core.registry import Tool
 
 # gedeckte Farben, die zum dunklen Bernstein-Look passen
@@ -19,6 +20,7 @@ PALETTE = ["#d9893a", "#4f9d8c", "#7f8fd1", "#c4636f", "#9bb55a", "#b07fc4",
 AGGREGATE_COLOR = "#4a4d53"
 MIN_TILE_PX = 3  # kleinere Kacheln werden nicht gezeichnet
 MAX_TILES = 400
+PREVIEW_EVERY_MS = 600  # während des Scans die Treemap so oft mit dem Zwischenstand neu zeichnen
 
 
 class Speicher(Tool):
@@ -38,6 +40,8 @@ class Speicher(Tool):
         self.progress = (0, 0)
         self.scanning = False
         self.refresh_target: Node | None = None  # gesetzt, wenn nur ein Teilbaum neu gescannt wird
+        self.partial: Node | None = None  # Wurzel des laufenden Scans (wächst live)
+        self.last_preview = 0.0
 
         top = ttk.Frame(parent)
         top.pack(fill="x")
@@ -122,11 +126,15 @@ class Speicher(Tool):
         self.scanning = True
         self.scan_btn.configure(text="Abbrechen", style="Stop.TButton")
         self.refresh_btn.configure(state="disabled")
+        self.partial = None
         cancel = self.cancel
+        # Teilbaum-Aktualisierung ohne Vorschau: der alte Stand bleibt sichtbar, bis der neue fertig ist.
+        on_start = None if self.refresh_target is not None else (lambda t: setattr(self, "partial", t))
 
         def work():
             try:
-                tree = scan(path, cancel, progress=lambda f, b: setattr(self, "progress", (f, b)))
+                tree = scan(path, cancel, progress=lambda f, b: setattr(self, "progress", (f, b)),
+                            on_start=on_start)
                 self.results.put(("done", tree))
             except ScanCancelled:
                 self.results.put(("cancelled", None))
@@ -143,9 +151,11 @@ class Speicher(Tool):
         except queue.Empty:
             files, size = self.progress
             self.set_info(f"Scanne … {format_count(files)} Dateien, {format_size(size)}")
+            self.update_preview()
             self.parent.after(150, self.poll)
             return
         self.scanning = False
+        partial, self.partial = self.partial, None
         self.scan_btn.configure(text="Scannen", style="Accent.TButton")
         target, self.refresh_target = self.refresh_target, None
         if self.current is not None:
@@ -155,20 +165,53 @@ class Speicher(Tool):
                 replace_subtree(target, payload)
                 if target is self.root_node:
                     self.root_node = payload
+                self.show(payload)
             else:
                 self.root_node = payload
-            self.show(payload)
-        elif kind == "cancelled":
-            self.set_info("Scan abgebrochen.")
-        else:
-            self.set_info(f"Fehler beim Scannen: {payload}")
+                # Wer während des Scans schon in einen Ordner geklickt hat, bleibt dort.
+                self.show(self.current if self.in_tree(self.current, payload) else payload)
+            return
+        if partial is not None and self.in_tree(self.current, partial):
+            # Vorschau eines abgebrochenen Scans verwerfen
+            if self.root_node is not None:
+                self.show(self.root_node)
+            else:
+                self.clear_view()
+        self.set_info("Scan abgebrochen." if kind == "cancelled" else f"Fehler beim Scannen: {payload}")
+
+    def update_preview(self) -> None:
+        now = time.monotonic()
+        if self.partial is None or now - self.last_preview < PREVIEW_EVERY_MS / 1000:
+            return
+        self.last_preview = now
+        # Neuer Scan: Vorschau übernimmt die Anzeige; wer darin navigiert hat, sieht seinen Ordner live wachsen.
+        self.show(self.current if self.in_tree(self.current, self.partial) else self.partial)
+
+    @staticmethod
+    def in_tree(node: Node | None, root: Node) -> bool:
+        while node is not None:
+            if node is root:
+                return True
+            node = node.parent
+        return False
+
+    def clear_view(self) -> None:
+        self.current = self.selected = None
+        self.items = []
+        self.tree.delete(*self.tree.get_children())
+        self.crumb.configure(text="")
+        self.up_btn.configure(state="disabled")
+        self.open_btn.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
+        self.draw()
 
     # --- Anzeige ----------------------------------------------------------
 
     def show(self, node: Node) -> None:
         self.current = node
         self.selected = None
-        self.items = [c for c in node.children if c.size > 0]
+        # Kopie + Sortierung: während eines Scans wachsen die Größen noch
+        self.items = sorted((c for c in list(node.children) if c.size > 0), key=lambda n: n.size, reverse=True)
         self.up_btn.configure(state="normal" if node.parent is not None else "disabled")
         self.open_btn.configure(state="normal")
         if not self.scanning:
@@ -181,7 +224,8 @@ class Speicher(Tool):
             pct = f"{child.size / total * 100:.0f}%" if child.size / total >= 0.01 else "<1%"
             self.tree.insert("", "end", iid=str(i), text=label, values=(format_size(child.size), pct))
         self.draw()
-        self.set_info(self.default_info())
+        if not self.scanning:
+            self.set_info(self.default_info())
 
     def default_info(self) -> str:
         if self.current is None:
@@ -296,4 +340,5 @@ class Speicher(Tool):
 
     def on_close(self) -> None:
         self.cancel.set()
+        shutdown_pool()
         self.settings["path"] = self.path_var.get().strip()

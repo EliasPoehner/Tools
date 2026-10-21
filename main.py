@@ -1,5 +1,6 @@
 """werkbank – Launcher für alle Tools in `tools/`."""
 
+import multiprocessing
 import re
 import sys
 import tkinter as tk
@@ -136,6 +137,7 @@ def _redirect_output_if_windowless() -> None:
 
 
 def main() -> None:
+    multiprocessing.freeze_support()  # .exe: Kindprozesse (z. B. Speicher-Scan) hier abfangen
     _redirect_output_if_windowless()
     if sys.platform == "win32":
         # Echte Pixel-Koordinaten, damit Mausposition und Bildschirm übereinstimmen.
