@@ -1,6 +1,7 @@
 """Speicherplatz-Analyse: Ordnerbaum einlesen und als Treemap-Rechtecke anordnen (ohne UI, testbar)."""
 
 import os
+import queue
 import threading
 from dataclasses import dataclass, field
 
@@ -41,70 +42,117 @@ def format_count(n: int) -> str:
     return f"{n:,}".replace(",", ".")
 
 
-def _is_link(entry: os.DirEntry) -> bool:
+def _is_junction(entry: os.DirEntry) -> bool:
     try:
-        if entry.is_symlink():
-            return True
-        is_junction = getattr(entry, "is_junction", None)
-        return bool(is_junction and is_junction())
-    except OSError:
-        return True
+        return entry.is_junction()  # Python 3.12+; Junctions zählen nicht als Symlink
+    except (AttributeError, OSError):
+        return False
+
+
+DEFAULT_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
 
 def scan(root: str, cancel: threading.Event | None = None, progress=None,
-         min_file_size: int = 1 << 20) -> Node:
-    """Liest `root` rekursiv ein. Symlinks/Junctions werden übersprungen.
+         min_file_size: int = 1 << 20, workers: int = DEFAULT_WORKERS, on_start=None) -> Node:
+    """Liest `root` ein – mehrere Ordner parallel. Symlinks/Junctions werden übersprungen.
 
     Dateien unter `min_file_size` werden pro Ordner zu einem Sammelknoten zusammengefasst,
     damit der Baum auch bei Millionen Dateien klein bleibt.
-    `progress(file_count, total_bytes)` wird gelegentlich aufgerufen.
+    `progress(file_count, total_bytes)` wird etwa alle 100 ms aufgerufen.
+    `on_start(root_node)` bekommt den Wurzelknoten sofort: Größen darin wachsen live mit,
+    Kinder sind aber erst nach Ende sortiert (für eine Vorschau während des Scans).
     """
     root = os.path.abspath(root)
-    state = {"files": 0, "bytes": 0}
+    tree = Node(name=root, path=root, is_dir=True)
+    if on_start is not None:
+        on_start(tree)
 
-    def walk(path: str, name: str, parent: Node | None) -> Node:
-        node = Node(name=name, path=path, is_dir=True, parent=parent)
-        small_size = small_count = 0
+    lock = threading.Lock()
+    totals = [0, 0]  # Dateien, Bytes
+    outstanding = 1  # Ordner in der Warteschlange oder in Arbeit
+    done = threading.Event()
+    errors: list[BaseException] = []
+    todo: queue.SimpleQueue[Node | None] = queue.SimpleQueue()
+    todo.put(tree)
+
+    def read_dir(node: Node) -> list[Node]:
+        files = size = small_size = small_count = 0
+        subdirs: list[Node] = []
+        big: list[Node] = []
         try:
-            entries = list(os.scandir(path))
+            with os.scandir(node.path) as it:  # Windows: liest ohne GIL, Größe kommt gratis mit
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not _is_junction(entry):
+                                subdirs.append(Node(entry.name, entry.path, is_dir=True, parent=node))
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            n = 0 if getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY else st.st_size
+                            files += 1
+                            size += n
+                            if n >= min_file_size:
+                                big.append(Node(entry.name, entry.path, n, parent=node, file_count=1))
+                            else:
+                                small_size += n
+                                small_count += 1
+                    except OSError:
+                        continue
         except OSError:
-            return node
-        for entry in entries:
-            if cancel is not None and cancel.is_set():
-                raise ScanCancelled
-            if _is_link(entry):
-                continue
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    child = walk(entry.path, entry.name, node)
-                    node.children.append(child)
-                    node.size += child.size
-                    node.file_count += child.file_count
-                elif entry.is_file(follow_symlinks=False):
-                    st = entry.stat(follow_symlinks=False)
-                    size = 0 if getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY else st.st_size
-                    node.size += size
-                    node.file_count += 1
-                    state["files"] += 1
-                    state["bytes"] += size
-                    if size >= min_file_size:
-                        node.children.append(Node(entry.name, entry.path, size, parent=node, file_count=1))
-                    else:
-                        small_size += size
-                        small_count += 1
-                    if progress is not None and state["files"] % 2000 == 0:
-                        progress(state["files"], state["bytes"])
-            except OSError:
-                continue
+            pass  # kein Zugriff o. Ä.: Ordner bleibt leer
         if small_count:
-            node.children.append(Node(SMALL_FILES_NAME, path, small_size, is_aggregate=True,
-                                      file_count=small_count, parent=node))
-        node.children.sort(key=lambda n: n.size, reverse=True)
-        return node
+            big.append(Node(SMALL_FILES_NAME, node.path, small_size, is_aggregate=True,
+                            file_count=small_count, parent=node))
+        node.children = subdirs + big
+        with lock:
+            totals[0] += files
+            totals[1] += size
+            p = node
+            while p is not None:  # Summen sofort nach oben tragen -> Live-Vorschau
+                p.size += size
+                p.file_count += files
+                p = p.parent
+        return subdirs
 
-    tree = walk(root, root, None)
+    def worker() -> None:
+        nonlocal outstanding
+        while (node := todo.get()) is not None:
+            subdirs: list[Node] = []
+            try:
+                if not (cancel is not None and cancel.is_set()):
+                    subdirs = read_dir(node)
+            except BaseException as e:  # unerwartet: merken, im Aufrufer-Thread erneut werfen
+                errors.append(e)
+            with lock:
+                outstanding += len(subdirs) - 1
+                finished = outstanding == 0
+            for d in subdirs:
+                todo.put(d)
+            if finished:
+                done.set()
+
+    threads = [threading.Thread(target=worker, name="scan", daemon=True) for _ in range(max(1, workers))]
+    for t in threads:
+        t.start()
+    while not done.wait(0.1):
+        if progress is not None:
+            progress(totals[0], totals[1])
+    for _ in threads:
+        todo.put(None)
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    if cancel is not None and cancel.is_set():
+        raise ScanCancelled
+
+    stack = [tree]  # iterativ statt rekursiv: auch beliebig tiefe Ordner sind kein Problem
+    while stack:
+        node = stack.pop()
+        node.children.sort(key=lambda n: n.size, reverse=True)
+        stack.extend(c for c in node.children if c.is_dir)
     if progress is not None:
-        progress(state["files"], state["bytes"])
+        progress(totals[0], totals[1])
     return tree
 
 

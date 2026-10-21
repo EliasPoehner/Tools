@@ -20,6 +20,14 @@ jobs:
           python -m venv .venv
           .venv\Scripts\python -m pip install -q -r requirements.txt
           .venv\Scripts\python -m pytest -v
+      - name: Scan-Benchmark (vorübergehend, nur Info)
+        continue-on-error: true
+        run: |
+          (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          $dirs = Get-ChildItem C:\hostedtoolcache\windows\Python -Directory | Where-Object Name -notlike '3.12*' | ForEach-Object FullName
+          $dirs
+          .venv\Scripts\python scripts/bench_scan.py --cold @dirs
+          .venv\Scripts\python scripts/bench_scan.py "C:\Program Files" C:\Windows\System32
       - name: werkbank.exe bauen
         shell: cmd
         run: build.bat
