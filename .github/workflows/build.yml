@@ -20,23 +20,10 @@ jobs:
           python -m venv .venv
           .venv\Scripts\python -m pip install -q -r requirements.txt
           .venv\Scripts\python -m pytest -v
-      - name: Scan-Benchmark (vorübergehend, nur Info)
-        continue-on-error: true
-        run: |
-          # Kalt: je Werkzeug mehrere gleichartige Versionsordner, jede Variante liest einen eigenen
-          foreach ($tool in Get-ChildItem C:\hostedtoolcache\windows -Directory) {
-            $dirs = @(Get-ChildItem $tool.FullName -Directory | Where-Object Name -notlike '3.12*' | ForEach-Object FullName)
-            if ($dirs.Count -ge 4) {
-              "== $($tool.Name)"
-              .venv\Scripts\python scripts/bench_scan.py --cold @dirs
-            }
-          }
-          .venv\Scripts\python scripts/bench_scan.py "C:\Program Files" C:\Windows\System32
       - name: Prozess-Scan in gepackter .exe prüfen (vorübergehend)
-        continue-on-error: true
         run: |
           .venv\Scripts\python -m PyInstaller --noconfirm --onefile --console --name scanbench --paths . --distpath benchdist scripts\bench_scan.py *> $null
-          benchdist\scanbench.exe "C:\Program Files (x86)"
+          .\benchdist\scanbench.exe "C:\Program Files (x86)"
       - name: werkbank.exe bauen
         shell: cmd
         run: build.bat
